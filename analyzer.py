@@ -17,7 +17,7 @@ def _read_audio_bytes(file_bytes: bytes, filename: str = "audio.wav") -> tuple[n
     """Ses baytlarını mono float32 dizisine ve örnekleme hızına çevirir."""
     ext = Path(filename).suffix.lower() if filename else ".wav"
 
-    # Önce soundfile ile doğrudan dene
+    # Önce soundfile ile doğrudan dene (.wav, .flac, bazı .ogg dosyaları)
     try:
         data, sr = sf.read(io.BytesIO(file_bytes), always_2d=False)
         audio = np.asarray(data, dtype=np.float32)
@@ -27,13 +27,19 @@ def _read_audio_bytes(file_bytes: bytes, filename: str = "audio.wav") -> tuple[n
     except Exception:
         pass
 
-    # Geçici dosyaya yazıp librosa ile dene (mp3, m4a, ogg vb. için)
+    # Geçici dosyaya yazıp librosa ile dene
     suffix = ext if ext else ".wav"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
-        tmp.write(file_bytes)
-        tmp.flush()
-        audio, sr = librosa.load(tmp.name, sr=None, mono=True)
-        return np.asarray(audio, dtype=np.float32), int(sr)
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
+            tmp.write(file_bytes)
+            tmp.flush()
+            audio, sr = librosa.load(tmp.name, sr=None, mono=True)
+            return np.asarray(audio, dtype=np.float32), int(sr)
+    except Exception as exc:
+        raise ValueError(
+            f"'{filename}' dosyası bu sunucu ortamında desteklenmeyen bir formatta ({ext or 'bilinmeyen'}). "
+            "Lütfen kaydı .wav formatına çevirip tekrar yükleyin."
+        ) from exc
 
 
 def _preprocess_audio(audio: np.ndarray, sr: int, target_sr: int = 16000) -> tuple[np.ndarray, int]:
@@ -41,18 +47,13 @@ def _preprocess_audio(audio: np.ndarray, sr: int, target_sr: int = 16000) -> tup
     if audio.size == 0:
         raise ValueError("Ses dosyası boş veya okunamıyor.")
 
-    # NaN / Inf temizliği
     audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-
-    # DC offset kaldır
     audio = audio - float(np.mean(audio))
 
-    # Hedef örnekleme hızına getir
     if sr != target_sr and sr > 0:
         audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sr).astype(np.float32)
         sr = target_sr
 
-    # Hafif Butterworth bant geçiren filtre (80 Hz - 7500 Hz)
     nyquist = 0.5 * sr
     low = max(20.0, 80.0) / nyquist
     high = min(7500.0, nyquist * 0.95) / nyquist
@@ -60,7 +61,6 @@ def _preprocess_audio(audio: np.ndarray, sr: int, target_sr: int = 16000) -> tup
         sos = signal.butter(4, [low, high], btype="bandpass", output="sos")
         audio = signal.sosfiltfilt(sos, audio).astype(np.float32)
 
-    # Tepe normalizasyonu
     peak = float(np.max(np.abs(audio)))
     if peak > 1e-6:
         audio = (audio / peak * 0.92).astype(np.float32)
@@ -112,7 +112,12 @@ def _extract_praat_features(audio: np.ndarray, sr: int) -> dict[str, float]:
             if s_local is not None and np.isfinite(s_local):
                 shimmer_pct = float(s_local * 100.0)
 
-        harmonicity = snd.to_harmonicity_cc(time_step=0.01, minimum_pitch=65.0, silence_threshold=0.1, periods_per_window=4.5)
+        harmonicity = snd.to_harmonicity_cc(
+            time_step=0.01,
+            minimum_pitch=65.0,
+            silence_threshold=0.1,
+            periods_per_window=4.5,
+        )
         hnr_vals = harmonicity.values[0]
         hnr_valid = hnr_vals[np.isfinite(hnr_vals) & (hnr_vals > -40.0)]
         hnr_db = float(np.mean(hnr_valid)) if hnr_valid.size > 0 else 0.0
@@ -133,17 +138,14 @@ def _extract_spectral_and_respiratory_features(audio: np.ndarray, sr: int) -> di
     """Spektral, MFCC ve enerji/duraksama tabanlı solunum akustik özelliklerini hesaplar."""
     duration_sec = float(len(audio) / sr) if sr > 0 else 0.0
 
-    # Kısa zamanlı RMS enerjisi ve nefes/duraksama analizi
     frame_length = int(0.025 * sr)
     hop_length = int(0.010 * sr)
     rms = librosa.feature.rms(y=audio, frame_length=frame_length, hop_length=hop_length)[0]
     rms_db = librosa.amplitude_to_db(np.maximum(rms, 1e-7), ref=np.max)
 
-    # Düşük enerjili segmentler (duraksama / nefes geçişi adayı)
     pause_mask = rms_db < -28.0
     pause_ratio = float(np.mean(pause_mask)) if pause_mask.size > 0 else 0.0
 
-    # Duraksama sayısı (ardışık düşük enerjili kare grupları >= 120 ms)
     min_pause_frames = max(1, int(0.12 / 0.010))
     pause_events = 0
     run_len = 0
@@ -157,24 +159,36 @@ def _extract_spectral_and_respiratory_features(audio: np.ndarray, sr: int) -> di
     if run_len >= min_pause_frames:
         pause_events += 1
 
-    # Spektral centroid, bandwidth, rolloff ve ZCR
-    spec_centroid = float(np.mean(librosa.feature.spectral_centroid(y=audio, sr=sr, hop_length=hop_length)[0]))
-    spec_bandwidth = float(np.mean(librosa.feature.spectral_bandwidth(y=audio, sr=sr, hop_length=hop_length)[0]))
-    spec_rolloff = float(np.mean(librosa.feature.spectral_rolloff(y=audio, sr=sr, hop_length=hop_length, roll_percent=0.85)[0]))
-    zcr_mean = float(np.mean(librosa.feature.zero_crossing_rate(y=audio, frame_length=frame_length, hop_length=hop_length)[0]))
+    spec_centroid = float(
+        np.mean(librosa.feature.spectral_centroid(y=audio, sr=sr, hop_length=hop_length)[0])
+    )
+    spec_bandwidth = float(
+        np.mean(librosa.feature.spectral_bandwidth(y=audio, sr=sr, hop_length=hop_length)[0])
+    )
+    spec_rolloff = float(
+        np.mean(
+            librosa.feature.spectral_rolloff(
+                y=audio, sr=sr, hop_length=hop_length, roll_percent=0.85
+            )[0]
+        )
+    )
+    zcr_mean = float(
+        np.mean(
+            librosa.feature.zero_crossing_rate(
+                y=audio, frame_length=frame_length, hop_length=hop_length
+            )[0]
+        )
+    )
 
-    # Yüksek frekans enerji oranı (> 3000 Hz)
     stft_mag = np.abs(librosa.stft(audio, n_fft=512, hop_length=hop_length))
     freqs = librosa.fft_frequencies(sr=sr, n_fft=512)
     total_energy = float(np.sum(stft_mag ** 2)) + 1e-9
     high_freq_energy = float(np.sum(stft_mag[freqs >= 3000.0, :] ** 2))
     high_freq_ratio = high_freq_energy / total_energy
 
-    # MFCC ortalamaları (ilk 6 katsayı)
     mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13, hop_length=hop_length)
     mfcc_means = [round(float(np.mean(mfcc[i])), 2) for i in range(6)]
 
-    # Spektrogram ve dalga formu için alt örneklenmiş diziler
     spectrogram_db = librosa.amplitude_to_db(stft_mag, ref=np.max)
 
     return {
